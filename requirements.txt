@@ -1,0 +1,9 @@
+# streamlit was missing from this file entirely - the app happened to run
+# locally because it was already installed, but a fresh deploy would fail.
+# 1.36 is the floor because app.py uses st.navigation / st.Page.
+streamlit>=1.36
+
+pandas>=2.0
+openpyxl>=3.1
+fpdf2>=2.7.6
+filelock>=3.12
