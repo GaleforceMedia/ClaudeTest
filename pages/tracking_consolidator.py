@@ -6,9 +6,12 @@ import datetime
 import streamlit.components.v1 as components
 from html import escape
 
+from storage import init_db, list_campaigns, record_shipments
 from utils import BRANDING, DEFAULT_BRAND, get_base64_image
 
 st.set_page_config(page_title="Tracking Consolidator", page_icon="🚚", layout="wide")
+
+init_db()
 
 # --- UI STYLING ---
 st.markdown("""
@@ -163,6 +166,54 @@ with right_col:
             else:
                 accounts = df['Accounts'].dropna().unique()
                 st.write(f"Detected **{len(accounts)}** distinct accounts in this export: {', '.join([str(a) for a in accounts])}")
+
+                # --- SAVE TO HISTORY ---------------------------------------
+                # This is where campaign history comes from. Without it the
+                # Insights page stays empty and client links have nothing
+                # to show.
+                with st.expander("💾 Save this export to campaign history", expanded=True):
+                    campaigns = list_campaigns()
+                    if not campaigns:
+                        st.caption(
+                            "No campaigns logged yet — add one on the **Campaign Master "
+                            "Schedule** page first, then come back to link this export to it."
+                        )
+                    else:
+                        labels = {
+                            f"{c['client']} — {c['name']} ({c['id']})": c["id"]
+                            for c in campaigns
+                        }
+                        chosen = st.selectbox("Link these shipments to", list(labels.keys()))
+                        st.caption(
+                            "Re-uploading a later export for the same campaign refreshes "
+                            "delivery status rather than duplicating rows, so it's safe to "
+                            "upload again as parcels move."
+                        )
+
+                        if st.button("Save to history"):
+                            rows = []
+                            for _, r in df.iterrows():
+                                shipment_no = str(r.get('Shipment number', '')).replace('.0', '').strip()
+                                if not shipment_no or shipment_no.lower() == 'nan':
+                                    continue
+                                rows.append({
+                                    "campaign_id": labels[chosen],
+                                    "account": str(r.get('Accounts', '')).strip(),
+                                    "consignment": shipment_no,
+                                    "tracking_number": shipment_no,
+                                    "recipient": str(r.get('Business/Recipient name', '')).strip(),
+                                    "postcode": str(r.get('Postal Code', '')).strip(),
+                                    "service": str(r.get('Service', '')).strip(),
+                                    "status": str(r.get('Status', '')).strip(),
+                                    "weight": pd.to_numeric(r.get('Weight'), errors='coerce') or 0.0,
+                                    "parcels": int(pd.to_numeric(r.get('Number of parcels'), errors='coerce') or 1),
+                                    "eta": str(r.get('Delivery due date', '')).strip(),
+                                    "dispatch_date": datetime.date.today().isoformat(),
+                                })
+                            written, skipped = record_shipments(rows)
+                            st.success(f"✅ {written} shipments saved to history.")
+                            if skipped:
+                                st.caption(f"{skipped} rows had no shipment number and were skipped.")
                 
                 if st.button("Generate Dashboards & CSVs"):
                     with st.spinner("Processing data, embedding logos, and generating files..."):

@@ -17,41 +17,38 @@ Then open http://localhost:8501.
 ## Running the tests
 
 ```bash
-python3 tests/test_layouts.py
+for t in tests/test_*.py; do python3 "$t" || exit 1; done
 ```
 
-Covers the three pick-list engines (M&P, Tim Hortons, Craft Union): store
-parsing, zero-quantity skipping, DHL row extraction, and the duplicate-store
-regression described below.
+45 checks across three suites: the pick-list engines (store parsing, zero-qty
+skipping, DHL extraction, the duplicate-store regression), the storage layer
+(upserts, idempotent re-uploads, share tokens), and an end-to-end walk of
+campaign → shipments → client link → insights.
 
 ---
 
 ## ⚠️ Read this before you host it
 
-### 1. Three pages write to CSV files, and that data is not safe
+### 1. Persistence — partly solved, not fully
 
-`Inventory Allocator`, `Campaign Master Schedule` and `Greggs Store Orders`
-save their state to CSV files next to the code (`live_inventory.csv`,
-`campaign_database.csv`, `greggs_orders_db.csv`).
+Campaigns and shipment history now live in SQLite (`storage.py`, default file
+`kep_portal.db`). That's what powers the Insights page and client tracking links.
 
-**On any host with an ephemeral filesystem — Streamlit Community Cloud, most
-container platforms, Heroku — those files are wiped every time the app
-restarts, redeploys, or goes to sleep.** Your entire warehouse stock count and
-campaign schedule silently reset to empty. This is the single biggest risk in
-the project and it will bite you the first time you push an update.
+**Three older pages still write plain CSVs** — `Inventory Allocator`,
+`Campaign Master Schedule` (its calendar) and `Greggs Store Orders`.
+
+Either way, **on a host with an ephemeral filesystem — Streamlit Community
+Cloud, most container platforms — the file is wiped on every restart and
+redeploy.** SQLite doesn't fix that on its own; it just makes the fix cheap,
+because all the SQL is in one module.
 
 Options, cheapest first:
 
 | Option | Effort | Notes |
 |---|---|---|
-| **Supabase / Neon** (hosted Postgres) | Low | Free tier is plenty. Swap the `load_*`/`save_*` functions for SQL. Best all-round choice. |
-| **Google Sheets** via `gspread` | Low | Non-technical staff can eyeball and fix data directly, which suits a warehouse. Slower, rate-limited. |
-| **SQLite on a persistent disk** | Medium | Only works on hosts that give you a real volume (Railway, Fly.io, a VM). Not Community Cloud. |
-| **Azure/S3 blob** | Medium | Fine if you're already in a cloud tenancy. |
-
-The three save functions are already isolated and each go through
-`utils.locked_save()`, so switching backends means changing three small
-functions, not rewriting pages.
+| **Point `KEP_DB_PATH` at a mounted volume** | Very low | Works on Railway, Fly.io, a VM. Not Community Cloud. |
+| **Supabase / Neon** (hosted Postgres) | Low | Free tier is plenty. `storage.py` has a recipe at the bottom — pages don't change at all. |
+| **Google Sheets** via `gspread` | Low | Non-technical staff can eyeball and fix data directly. Slower, rate-limited. |
 
 ### 2. Concurrency
 
@@ -88,17 +85,58 @@ you're already a Microsoft shop, that gets you real named accounts.
 ```
 app.py                  entrypoint + navigation menu + shared header
 utils.py                shared branding, image encoder, login gate, save lock
+storage.py              SQLite persistence: campaigns, shipment history, share tokens
 mp_layout.py            Mamas & Papas pick list PDF + DHL extraction
 th_layout.py            Tim Hortons pick list PDF
 cu_layout.py            Craft Union pick list PDF
 pages/                  one file per screen
-tests/test_layouts.py   regression tests for the three PDF engines
+tests/                  test_layouts.py, test_storage.py, test_end_to_end.py
 KEP OCT 2025.xlsx       material price list (Purchase Requisition reads this)
 ```
 
 Navigation lives in `app.py`. To add a page: drop the file in `pages/`, then
 add one `st.Page(...)` line under the right heading. Page titles, icons and
 ordering are all set there now, so filenames stay clean.
+
+---
+
+## Client tracking links
+
+Instead of emailing a dashboard, issue a client a link they refresh themselves.
+
+**Campaign Master Schedule → 🔗 Client Links** → sync campaigns → *Create link*.
+That produces `https://your-portal/?share=<token>`, which opens a read-only view
+of that campaign's deliveries and nothing else.
+
+How the isolation works: `app.py` resolves the token *before* building the
+navigation. When a valid token is present, the client tracking page is the only
+page registered for that session — there's no menu and no route to any internal
+page. That's enforced by Streamlit's navigation, not hidden with CSS.
+
+**Two things to be aware of:**
+
+- **Turn the portal password on first.** The share link keeps a client inside the
+  client view, but it does nothing to stop someone deleting `?share=...` from the
+  URL and landing on the internal portal. `require_login()` is what stops that,
+  and it's off until you set the secret.
+- **A share token is a bearer token** — like a document share link, anyone holding
+  it can view that campaign. Revoke links when a campaign closes; there's a button
+  for it on the same tab.
+
+## Insights
+
+**Insights** reads the accumulated history and answers the questions you couldn't
+ask before: spend and volume by client, which clients attract the most surcharges
+(and which destinations repeatedly do — usually a dimension logged wrong at
+booking), volume over time, and how collation hours actually distribute across
+weekdays against the 16-hour cap.
+
+It fills up from **Tracking Consolidator → 💾 Save this export to campaign
+history**. Re-uploading a later export for the same campaign refreshes delivery
+status rather than duplicating rows, so CSRs can safely upload again as parcels
+move — that's also what keeps client links current.
+
+The page is empty until you start saving exports. It gets more useful every week.
 
 ---
 
@@ -133,6 +171,17 @@ ordering are all set there now, so filenames stay clean.
   will break on a future Python.
 - `greggs_orders.save_db` no longer mutates the caller's DataFrame.
 
+**Added**
+
+- `storage.py` — SQLite persistence for campaigns and shipment history, with
+  idempotent shipment recording and share tokens. Stdlib only, no new
+  dependencies, with a documented Postgres migration path.
+- **Insights** page — historical analytics across clients, surcharges, volume
+  and collation load.
+- **Client tracking links** — read-only per-campaign views for clients.
+- **Tracking Consolidator** can now save exports to history.
+- Two more test suites (`test_storage.py`, `test_end_to_end.py`).
+
 **Cleaned up**
 
 - ~60 lines of branding config and the base64 image helper were copy-pasted
@@ -147,8 +196,9 @@ ordering are all set there now, so filenames stay clean.
 
 Roughly in order of payback:
 
-1. **Move the three CSV pages to a real database.** See the table above. This
-   is the one that stops you losing data.
+1. **Move the remaining three CSV pages onto `storage.py`.** Inventory,
+   the campaign calendar and Greggs orders are the last things still on flat
+   files. The pattern is established now — follow what `campaigns` does.
 2. **Barcode/QR on pick lists.** Print the job number as a barcode; a warehouse
    scanner then confirms picks instead of someone ticking a box. Biggest
    accuracy win available and `fpdf2` can render them directly.

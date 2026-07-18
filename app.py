@@ -1,8 +1,28 @@
 import streamlit as st
 
+from storage import get_campaign_by_token, init_db
 from utils import KEP_BLUE, get_base64_image, require_login
 
 st.set_page_config(page_title="KEP Portal", page_icon="🏠", layout="wide")
+
+init_db()
+
+
+# --- CLIENT MODE ----------------------------------------------------------
+# Resolved BEFORE the internal navigation is built. When a valid share
+# token is present, the client tracking page is the only page registered
+# for this session, so there is no menu and no route to anything internal.
+#
+# NOTE: this protects the client from wandering in. It does NOT protect
+# the internal app from someone who simply drops the ?share= parameter -
+# that's what require_login() below is for. Turn the password on before
+# you send a link to anyone outside KEP.
+_token = st.query_params.get("share")
+if _token and get_campaign_by_token(_token):
+    st.navigation([
+        st.Page("pages/client_tracking.py", title="Delivery tracking", default=True)
+    ]).run()
+    st.stop()
 
 
 # --- SHARED BLUE HEADER (now shown on every page, not just Home) ---
@@ -36,6 +56,7 @@ require_login()
 pages = {
     "Overview": [
         st.Page("pages/home.py", title="Home", icon="🏠", default=True),
+        st.Page("pages/insights.py", title="Insights", icon="📈"),
     ],
     "Dispatch & Shipping": [
         st.Page("pages/pick_lists.py", title="Pick Lists", icon="📦"),

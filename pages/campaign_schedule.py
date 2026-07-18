@@ -4,6 +4,8 @@ import os
 import datetime
 import calendar
 
+from storage import (ensure_share_token, init_db, list_campaigns,
+                     revoke_share_token, upsert_campaign)
 from utils import locked_save
 
 st.set_page_config(page_title="Campaign Schedule", page_icon="📅", layout="wide")
@@ -58,6 +60,8 @@ st.title("📅 Master Campaign Schedule")
 st.write("Live dispatch tracker, interactive capacity calendar, and file vault.")
 
 # --- DATABASE MANAGEMENT ---
+init_db()
+
 DB_FILE = "campaign_database.csv"
 UPLOAD_DIR = "campaign_files"
 MAX_DAILY_HOURS = 16.0 
@@ -85,12 +89,13 @@ def save_db(df):
 df = load_db()
 
 # --- APP TABS ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📋 Live Status Calendar", 
     "➕ Add Campaign", 
     "🗓️ Visual Capacity Calendar", 
     "📁 File Vault",
-    "⚙️ Import Legacy Data"
+    "⚙️ Import Legacy Data",
+    "🔗 Client Links"
 ])
 
 # ==========================================
@@ -317,3 +322,103 @@ with tab5:
                     st.success(f"✅ Imported {len(new_recs)} campaigns!")
                     st.rerun()
         except Exception as e: st.error(f"Error: {e}")
+
+# ==========================================
+# TAB 6: CLIENT LINKS
+# ==========================================
+with tab6:
+    st.subheader("🔗 Client tracking links")
+    st.write(
+        "Give a client a link they can refresh themselves instead of emailing "
+        "them a dashboard. The link shows delivery status for that campaign only."
+    )
+
+    if not st.secrets.get("app_password"):
+        st.warning(
+            "**Turn the portal password on before sharing any link.** A share link "
+            "only opens the client view — but without a password, anyone who removes "
+            "the `?share=` part of the URL reaches the full internal portal. "
+            "See README.md → *There's no access control by default*.",
+            icon="⚠️",
+        )
+
+    base_url = st.text_input(
+        "Portal address",
+        value=st.session_state.get("kep_base_url", ""),
+        placeholder="https://kep-portal.streamlit.app",
+        key="kep_base_url",
+        help="The address CSRs use to reach this portal. Used to build the shareable link.",
+    )
+
+    if df.empty:
+        st.info("Add a campaign first.")
+    else:
+        # The calendar keeps campaigns in CSV; the share links need them in
+        # the database. This copies them across (and is safe to re-run).
+        if st.button("🔄 Sync campaigns to database"):
+            synced = 0
+            for _, row in df.iterrows():
+                d = row.get("Dispatch Date")
+                upsert_campaign(
+                    campaign_id=str(row.get("ID", "")).strip(),
+                    client=str(row.get("Client", "")).strip(),
+                    name=str(row.get("Campaign Name", "")).strip(),
+                    am=str(row.get("AM", "") or ""),
+                    dispatch_date=(d.date().isoformat() if pd.notna(d) else None),
+                    stores=int(pd.to_numeric(row.get("Stores (Qty)"), errors="coerce") or 0),
+                    collation_hrs=float(pd.to_numeric(row.get("Collation (Hrs)"), errors="coerce") or 0),
+                    status=str(row.get("Status", "") or ""),
+                    notes=str(row.get("Notes", "") or ""),
+                )
+                synced += 1
+            st.success(f"✅ Synced {synced} campaigns. You can now issue links for them.")
+
+        stored = list_campaigns()
+        if not stored:
+            st.info("Nothing synced yet — press **Sync campaigns to database** above.")
+        else:
+            labels = {f"{c['client']} — {c['name']} ({c['id']})": c for c in stored}
+            picked = st.selectbox("Campaign", list(labels.keys()))
+            campaign = labels[picked]
+
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                if campaign.get("share_token"):
+                    link = (
+                        f"{base_url.rstrip('/')}/?share={campaign['share_token']}"
+                        if base_url else f"?share={campaign['share_token']}"
+                    )
+                    st.text_input("Shareable link", value=link, key=f"link_{campaign['id']}")
+                    if not base_url:
+                        st.caption("Enter the portal address above to get the full link.")
+                else:
+                    st.caption("No link issued for this campaign yet.")
+
+            with col_b:
+                st.write("")
+                if campaign.get("share_token"):
+                    if st.button("Revoke", use_container_width=True):
+                        revoke_share_token(campaign["id"])
+                        st.success("Link revoked.")
+                        st.rerun()
+                else:
+                    if st.button("Create link", use_container_width=True):
+                        ensure_share_token(campaign["id"])
+                        st.rerun()
+
+            st.divider()
+            st.write("**Links currently active**")
+            active = [c for c in stored if c.get("share_token")]
+            if not active:
+                st.caption("None. Links you create will be listed here so you can see what's live.")
+            else:
+                st.dataframe(
+                    [{"Campaign": f"{c['client']} — {c['name']}",
+                      "Dispatch": c.get("dispatch_date") or "—",
+                      "Status": c.get("status") or "—"} for c in active],
+                    use_container_width=True, hide_index=True,
+                )
+                st.caption(
+                    "Revoke links once a campaign is closed — a share link is a bearer "
+                    "token, so anyone who has it can keep viewing that campaign."
+                )
